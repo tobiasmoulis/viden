@@ -21,6 +21,7 @@ def spark() -> Iterator[SparkSession]:
             "spark.ui.enabled": "false",
             "spark.eventLog.enabled": "false",
             "spark.sql.warehouse.dir": "/tmp/spark-warehouse-tests",
+            "spark.databricks.delta.snapshotPartitions": "2",
         },
     )
     yield session
