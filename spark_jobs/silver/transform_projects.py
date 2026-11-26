@@ -79,30 +79,38 @@ def transform_projects(
     )
     evaluated_df = normalized_df.withColumn(
         "dq_reasons", F.filter(reason_exprs, lambda reason: reason.isNotNull())
-    )
+    ).persist()
 
-    quarantine_df = evaluated_df.filter(F.size("dq_reasons") > 0)
+    try:
+        quarantine_df = evaluated_df.filter(F.size("dq_reasons") > 0)
 
-    dedup_window = Window.partitionBy("project_id").orderBy(
-        F.col("_ingested_at").desc(),
-        F.col("budget_eur").desc(),
-    )
-    valid_df = (
-        evaluated_df.filter(F.size("dq_reasons") == 0)
-        .drop("dq_reasons")
-        .withColumn("_rn", F.row_number().over(dedup_window))
-        .filter(F.col("_rn") == 1)
-        .drop("_rn")
-        .withColumn("_silver_updated_at", F.current_timestamp())
-        .select(*SILVER_PROJECTS_COLUMNS)
-    )
+        dedup_window = Window.partitionBy("project_id").orderBy(
+            F.col("_ingested_at").desc(),
+            F.col("budget_eur").desc(),
+        )
+        valid_df = (
+            evaluated_df.filter(F.size("dq_reasons") == 0)
+            .drop("dq_reasons")
+            .withColumn("_rn", F.row_number().over(dedup_window))
+            .filter(F.col("_rn") == 1)
+            .drop("_rn")
+            .withColumn("_silver_updated_at", F.current_timestamp())
+            .select(*SILVER_PROJECTS_COLUMNS)
+        )
 
-    write_delta_overwrite(valid_df, silver_path)
-    write_quarantine(spark, quarantine_df, quarantine_path, iso_date)
+        write_delta_overwrite(valid_df, silver_path)
+        write_quarantine(spark, quarantine_df, quarantine_path, iso_date)
+    finally:
+        evaluated_df.unpersist()
 
     persisted_df = spark.read.format("delta").load(silver_path)
+    persisted_quarantine_df = (
+        spark.read.format("delta")
+        .load(quarantine_path)
+        .filter(F.col("_batch_date") == F.to_date(F.lit(iso_date)))
+    )
     valid_count = persisted_df.count()
-    quarantined_count = quarantine_df.count()
+    quarantined_count = persisted_quarantine_df.count()
 
     dq_results = [
         check_expected_columns(
@@ -145,7 +153,7 @@ def transform_projects(
     write_audit_results(spark, dq_results, audit_path)
     enforce_dq_gate(dq_results)
 
-    return persisted_df, quarantine_df
+    return persisted_df, persisted_quarantine_df
 
 
 def run(

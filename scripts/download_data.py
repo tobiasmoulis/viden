@@ -383,7 +383,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--r2-prefix",
         default=None,
-        help="R2 prefix containing MANIFEST.sha256 (default: $R2_PREFIX or course-2026).",
+        help="R2 prefix containing MANIFEST.sha256 (default: $R2_PREFIX or course-2026/archives).",
     )
     parser.add_argument("--r2-access-key", default=None, help="Cloudflare R2 access key ID.")
     parser.add_argument("--r2-secret-key", default=None, help="Cloudflare R2 secret access key.")
@@ -429,7 +429,7 @@ def main(argv: list[str] | None = None) -> int:
             prefix = (
                 args.r2_prefix
                 if args.r2_prefix is not None
-                else os.getenv("R2_PREFIX", "course-2026")
+                else os.getenv("R2_PREFIX", "course-2026/archives")
             ).strip()
             access_key = (args.r2_access_key or os.getenv("R2_STUDENT_ACCESS_KEY_ID", "")).strip()
             secret_key = (

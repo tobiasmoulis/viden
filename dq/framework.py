@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import logging
+import os
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 
 from delta.tables import DeltaTable
+from py4j.protocol import Py4JJavaError
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
@@ -63,10 +66,6 @@ def _parse_batch_date(value: str | date) -> date:
     if isinstance(value, date):
         return value
     return date.fromisoformat(value)
-
-
-def _escape_sql_literal(value: str) -> str:
-    return value.replace("'", "''")
 
 
 def build_dq_result(
@@ -156,14 +155,41 @@ def check_expected_columns(
     )
 
 
+def _is_delta_concurrency_error(exc: Exception) -> bool:
+    msg = str(exc)
+    return any(
+        token in msg
+        for token in (
+            "ConcurrentAppendException",
+            "ConcurrentDeleteReadException",
+            "ConcurrentDeleteDeleteException",
+            "ConcurrentTransactionException",
+            "MetadataChangedException",
+            "ProtocolChangedException",
+        )
+    )
+
+
 def write_audit_results(
     spark: SparkSession,
     results: Sequence[DQCheckResult],
     audit_table_path: str,
+    *,
+    max_retries: int = 5,
 ) -> DataFrame:
-    """Persist DQCheckResult records idempotently to the `dq_audit_results` Delta table."""
+    """Persist DQCheckResult records idempotently and concurrency-safely to Delta.
+
+    Uses atomic Delta `MERGE` keyed on `(batch_date, layer, table_name, check_name)`
+    with retry/backoff on Delta optimistic concurrency conflicts so parallel Airflow
+    tasks can write audit records safely at the same time without erasing each other.
+    """
     if not results:
         return spark.createDataFrame([], schema=DQ_AUDIT_SCHEMA)
+
+    # Deduplicate by audit primary key (keep latest) so MERGE never matches multiple source rows.
+    deduped: dict[tuple[date, str, str, str], DQCheckResult] = {}
+    for r in results:
+        deduped[(r.batch_date, r.layer, r.table_name, r.check_name)] = r
 
     rows = [
         (
@@ -178,32 +204,49 @@ def write_audit_results(
             int(r.total_count),
             r.checked_at,
         )
-        for r in results
+        for r in deduped.values()
     ]
     audit_df = spark.createDataFrame(rows, schema=DQ_AUDIT_SCHEMA)
 
-    if DeltaTable.isDeltaTable(spark, audit_table_path):
-        # Replace existing audit records for the same (batch_date, layer, table_name, check_name)
-        # so re-running a batch or central DQ gate remains idempotent without erasing
-        # checks emitted by individual Silver/Gold jobs.
-        unique_scopes = {(r.batch_date, r.layer, r.table_name, r.check_name) for r in results}
-        predicates = [
-            (
-                f"(batch_date = DATE '{bd.isoformat()}' "
-                f"AND layer = '{_escape_sql_literal(lyr)}' "
-                f"AND table_name = '{_escape_sql_literal(tbl)}' "
-                f"AND check_name = '{_escape_sql_literal(chk)}')"
-            )
-            for bd, lyr, tbl, chk in sorted(unique_scopes)
-        ]
-        DeltaTable.forPath(spark, audit_table_path).delete(" OR ".join(predicates))
-        audit_df.write.format("delta").mode("append").partitionBy("batch_date").save(
-            audit_table_path
-        )
-    else:
-        audit_df.write.format("delta").mode("overwrite").partitionBy("batch_date").save(
-            audit_table_path
-        )
+    join_cond = (
+        "target.batch_date = source.batch_date "
+        "AND target.layer = source.layer "
+        "AND target.table_name = source.table_name "
+        "AND target.check_name = source.check_name"
+    )
+
+    for attempt in range(max_retries):
+        try:
+            if DeltaTable.isDeltaTable(spark, audit_table_path):
+                (
+                    DeltaTable.forPath(spark, audit_table_path)
+                    .alias("target")
+                    .merge(audit_df.alias("source"), join_cond)
+                    .whenMatchedUpdateAll()
+                    .whenNotMatchedInsertAll()
+                    .execute()
+                )
+            else:
+                (
+                    audit_df.write.format("delta")
+                    .mode("overwrite")
+                    .partitionBy("batch_date")
+                    .save(audit_table_path)
+                )
+            return audit_df
+        except (Py4JJavaError, Exception) as exc:
+            if attempt < max_retries - 1 and _is_delta_concurrency_error(exc):
+                delay = 0.25 * (2**attempt) + (os.getpid() % 5) * 0.07
+                logger.warning(
+                    "Delta concurrency conflict writing dq_audit_results "
+                    "(attempt %d/%d); retrying in %.2fs",
+                    attempt + 1,
+                    max_retries,
+                    delay,
+                )
+                time.sleep(delay)
+                continue
+            raise
 
     return audit_df
 

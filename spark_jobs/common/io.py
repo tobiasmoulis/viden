@@ -120,12 +120,13 @@ def write_delta_partition(
     batch_date: str | date,
     *,
     partition_col: str = "_batch_date",
+    merge_schema: bool = False,
 ) -> None:
     """Idempotently replace a single `_batch_date` partition in a Delta table.
 
     - If the target table does not exist yet, creates it partitioned by `partition_col`.
     - If it exists and `df` is non-empty, replaces only `partition_col = DATE '<batch_date>'`
-      atomically via `replaceWhere`.
+      atomically via `replaceWhere` (with optional additive `mergeSchema`).
     - If it exists and `df` is empty, deletes any stale rows for `batch_date`.
     """
     col_name = _validate_identifier(partition_col)
@@ -139,12 +140,10 @@ def write_delta_partition(
         if df.isEmpty():
             DeltaTable.forPath(spark, target_path).delete(predicate)
         else:
-            (
-                df.write.format("delta")
-                .mode("overwrite")
-                .option("replaceWhere", predicate)
-                .save(target_path)
-            )
+            writer = df.write.format("delta").mode("overwrite").option("replaceWhere", predicate)
+            if merge_schema:
+                writer = writer.option("mergeSchema", "true")
+            writer.save(target_path)
     else:
         (df.write.format("delta").mode("overwrite").partitionBy(col_name).save(target_path))
 
@@ -166,4 +165,5 @@ def write_quarantine(
         quarantine_path,
         batch_date,
         partition_col="_batch_date",
+        merge_schema=True,
     )

@@ -80,13 +80,20 @@ def _parse_bool_str(column_name: str):
     )
 
 
+def _parse_iso_date(column_name: str):
+    cleaned = clean_str(column_name)
+    return F.when(
+        cleaned.rlike(r"^\d{4}-\d{2}-\d{2}$"), F.to_date(cleaned, "yyyy-MM-dd")
+    ).otherwise(F.lit(None).cast("date"))
+
+
 def transform_employees_scd2(
     spark: SparkSession,
     batch_date: str,
     lakehouse_root: str | None = None,
     run_id: str | None = None,
 ) -> tuple[DataFrame, DataFrame]:
-    """Build `silver/silver_employees_scd2` from `bronze/employees` up to `batch_date`."""
+    """Build `silver/silver_employees_scd2` preserving full Bronze history on earlier re-runs."""
     parsed_date = parse_batch_date(batch_date)
     iso_date = parsed_date.isoformat()
     resolved_lakehouse = get_lakehouse_root(lakehouse_root)
@@ -97,10 +104,14 @@ def transform_employees_scd2(
     quarantine_path = join_path(resolved_lakehouse, "silver_quarantine", "employees")
     audit_path = join_path(resolved_lakehouse, "dq", "dq_audit_results")
 
-    bronze_df = (
-        spark.read.format("delta")
-        .load(bronze_path)
-        .filter(F.col("_batch_date") <= F.to_date(F.lit(iso_date)))
+    # Never truncate later Bronze history when re-running an earlier `batch_date`.
+    bronze_all_df = spark.read.format("delta").load(bronze_path)
+    max_bronze_row = bronze_all_df.agg(F.max("_batch_date").alias("max_bd")).first()
+    max_bronze_date = max_bronze_row["max_bd"] if max_bronze_row is not None else None
+    effective_end_date = max(parsed_date, max_bronze_date) if max_bronze_date else parsed_date
+
+    bronze_df = bronze_all_df.filter(
+        F.col("_batch_date") <= F.to_date(F.lit(effective_end_date.isoformat()))
     )
 
     typed_df = bronze_df.select(
@@ -110,18 +121,15 @@ def transform_employees_scd2(
         clean_str("role").alias("role"),
         clean_str("seniority_level").alias("seniority_level"),
         F.col("hourly_rate_eur").cast("double").alias("hourly_rate_eur"),
-        F.to_date(clean_str("hire_date"), "yyyy-MM-dd").alias("hire_date"),
-        F.to_date(clean_str("last_promotion_date"), "yyyy-MM-dd").alias("last_promotion_date"),
+        _parse_iso_date("hire_date").alias("hire_date"),
+        _parse_iso_date("last_promotion_date").alias("last_promotion_date"),
         clean_str("work_mode").alias("work_mode"),
         F.col("distance_km").cast("double").alias("distance_km"),
         clean_str("manager_id").alias("manager_id"),
         _parse_bool_str("is_active").alias("is_active"),
-        F.to_date(clean_str("termination_date"), "yyyy-MM-dd").alias("termination_date"),
+        _parse_iso_date("termination_date").alias("termination_date"),
         clean_str("churn_type").alias("churn_type"),
-        F.coalesce(
-            F.to_date(clean_str("snapshot_date"), "yyyy-MM-dd"),
-            F.col("_batch_date"),
-        ).alias("snapshot_date"),
+        F.coalesce(_parse_iso_date("snapshot_date"), F.col("_batch_date")).alias("snapshot_date"),
         F.col("_batch_date"),
         F.col("_ingested_at"),
         F.col("_source_file"),
@@ -138,64 +146,72 @@ def transform_employees_scd2(
     )
     evaluated_df = typed_df.withColumn(
         "dq_reasons", F.filter(reason_exprs, lambda reason: reason.isNotNull())
-    )
+    ).persist()
 
-    current_batch_quarantine_df = evaluated_df.filter(
-        (F.size("dq_reasons") > 0) & (F.col("_batch_date") == F.to_date(F.lit(iso_date)))
-    )
-    current_batch_valid_count = evaluated_df.filter(
-        (F.size("dq_reasons") == 0) & (F.col("_batch_date") == F.to_date(F.lit(iso_date)))
-    ).count()
-
-    # Deduplicate snapshots per (emp_id, snapshot_date) deterministically.
-    dedup_window = Window.partitionBy("emp_id", "snapshot_date").orderBy(
-        F.col("_ingested_at").desc(),
-        F.col("hourly_rate_eur").asc_nulls_last(),
-    )
-    clean_snapshots_df = (
-        evaluated_df.filter(F.size("dq_reasons") == 0)
-        .drop("dq_reasons")
-        .withColumn("_rn", F.row_number().over(dedup_window))
-        .filter(F.col("_rn") == 1)
-        .drop("_rn")
-    )
-
-    # Detect SCD Type 2 changes across consecutive snapshots per employee.
-    tracked_hash = F.sha2(
-        F.concat_ws(
-            "||",
-            *[
-                F.coalesce(F.col(c).cast("string"), F.lit("__NULL__"))
-                for c in TRACKED_SCD2_ATTRIBUTES
-            ],
-        ),
-        256,
-    )
-    emp_timeline = Window.partitionBy("emp_id").orderBy(F.col("snapshot_date").asc())
-    changes_df = (
-        clean_snapshots_df.withColumn("_tracked_hash", tracked_hash)
-        .withColumn("_prev_hash", F.lag("_tracked_hash").over(emp_timeline))
-        .filter(F.col("_prev_hash").isNull() | (F.col("_tracked_hash") != F.col("_prev_hash")))
-    )
-
-    version_window = Window.partitionBy("emp_id").orderBy(F.col("snapshot_date").asc())
-    scd2_df = (
-        changes_df.withColumn("valid_from", F.col("snapshot_date"))
-        .withColumn("_next_valid_from", F.lead("snapshot_date").over(version_window))
-        .withColumn(
-            "valid_to",
-            F.coalesce(F.col("_next_valid_from"), F.lit(OPEN_END_SENTINEL)),
+    try:
+        current_batch_quarantine_df = evaluated_df.filter(
+            (F.size("dq_reasons") > 0) & (F.col("_batch_date") == F.to_date(F.lit(iso_date)))
         )
-        .withColumn("is_current", F.col("_next_valid_from").isNull())
-        .withColumn("_silver_updated_at", F.current_timestamp())
-        .select(*SILVER_EMPLOYEES_SCD2_COLUMNS)
-    )
+        current_batch_valid_count = evaluated_df.filter(
+            (F.size("dq_reasons") == 0) & (F.col("_batch_date") == F.to_date(F.lit(iso_date)))
+        ).count()
 
-    write_delta_overwrite(scd2_df, silver_path)
-    write_quarantine(spark, current_batch_quarantine_df, quarantine_path, iso_date)
+        # Deduplicate snapshots per (emp_id, snapshot_date) deterministically.
+        dedup_window = Window.partitionBy("emp_id", "snapshot_date").orderBy(
+            F.col("_ingested_at").desc(),
+            F.col("hourly_rate_eur").asc_nulls_last(),
+        )
+        clean_snapshots_df = (
+            evaluated_df.filter(F.size("dq_reasons") == 0)
+            .drop("dq_reasons")
+            .withColumn("_rn", F.row_number().over(dedup_window))
+            .filter(F.col("_rn") == 1)
+            .drop("_rn")
+        )
+
+        # Detect SCD Type 2 changes across consecutive snapshots per employee.
+        tracked_hash = F.sha2(
+            F.concat_ws(
+                "||",
+                *[
+                    F.coalesce(F.col(c).cast("string"), F.lit("__NULL__"))
+                    for c in TRACKED_SCD2_ATTRIBUTES
+                ],
+            ),
+            256,
+        )
+        emp_timeline = Window.partitionBy("emp_id").orderBy(F.col("snapshot_date").asc())
+        changes_df = (
+            clean_snapshots_df.withColumn("_tracked_hash", tracked_hash)
+            .withColumn("_prev_hash", F.lag("_tracked_hash").over(emp_timeline))
+            .filter(F.col("_prev_hash").isNull() | (F.col("_tracked_hash") != F.col("_prev_hash")))
+        )
+
+        version_window = Window.partitionBy("emp_id").orderBy(F.col("snapshot_date").asc())
+        scd2_df = (
+            changes_df.withColumn("valid_from", F.col("snapshot_date"))
+            .withColumn("_next_valid_from", F.lead("snapshot_date").over(version_window))
+            .withColumn(
+                "valid_to",
+                F.coalesce(F.col("_next_valid_from"), F.lit(OPEN_END_SENTINEL)),
+            )
+            .withColumn("is_current", F.col("_next_valid_from").isNull())
+            .withColumn("_silver_updated_at", F.current_timestamp())
+            .select(*SILVER_EMPLOYEES_SCD2_COLUMNS)
+        )
+
+        write_delta_overwrite(scd2_df, silver_path)
+        write_quarantine(spark, current_batch_quarantine_df, quarantine_path, iso_date)
+    finally:
+        evaluated_df.unpersist()
 
     persisted_df = spark.read.format("delta").load(silver_path)
-    quarantined_count = current_batch_quarantine_df.count()
+    persisted_quarantine_df = (
+        spark.read.format("delta")
+        .load(quarantine_path)
+        .filter(F.col("_batch_date") == F.to_date(F.lit(iso_date)))
+    )
+    quarantined_count = persisted_quarantine_df.count()
     dq_results = [
         check_expected_columns(
             persisted_df,
@@ -246,7 +262,7 @@ def transform_employees_scd2(
     write_audit_results(spark, dq_results, audit_path)
     enforce_dq_gate(dq_results)
 
-    return persisted_df, current_batch_quarantine_df
+    return persisted_df, persisted_quarantine_df
 
 
 def run(

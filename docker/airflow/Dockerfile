@@ -39,6 +39,7 @@ RUN PYSPARK_DIR="$(python -c 'import pathlib, pyspark; print(pathlib.Path(pyspar
       echo "spark.sql.catalog.spark_catalog          org.apache.spark.sql.delta.catalog.DeltaCatalog"; \
       echo "spark.sql.session.timeZone               UTC"; \
       echo "spark.executorEnv.PYTHONPATH             /opt/workspace"; \
+      echo "spark.driver.bindAddress                 0.0.0.0"; \
     } > "${PYSPARK_DIR}/conf/spark-defaults.conf" && \
     echo "${PYSPARK_DIR}" > /tmp/pyspark_dir
 

@@ -134,6 +134,15 @@ def test_write_delta_overwrite_and_write_quarantine(spark, tmp_path: Path) -> No
     write_quarantine(spark, q_df, q_path, "2026-01-01")
     assert spark.read.format("delta").load(q_path).count() == 1
 
+    # Additive diagnostic columns evolve quarantine schema cleanly across partition writes.
+    q_evolved_df = q_df.withColumn("_batch_date", F.to_date(F.lit("2026-01-02"))).withColumn(
+        "_raw_payload", F.lit("bad-ts")
+    )
+    write_quarantine(spark, q_evolved_df, q_path, "2026-01-02")
+    q_all = spark.read.format("delta").load(q_path)
+    assert "_raw_payload" in q_all.columns
+    assert q_all.count() == 2
+
     # Missing required quarantine columns must raise ValueError.
     bad_df = spark.createDataFrame([("X",)], ["id"]).withColumn(
         "_batch_date", F.to_date(F.lit("2026-01-01"))

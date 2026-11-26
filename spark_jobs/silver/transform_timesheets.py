@@ -136,28 +136,36 @@ def transform_timesheets(
     )
     evaluated_df = enriched_df.withColumn(
         "dq_reasons", F.filter(reason_exprs, lambda reason: reason.isNotNull())
-    )
+    ).persist()
 
-    quarantine_df = evaluated_df.filter(F.size("dq_reasons") > 0).drop("_emp_termination_date")
-    zombie_count = evaluated_df.filter(is_zombie).count()
+    try:
+        quarantine_df = evaluated_df.filter(F.size("dq_reasons") > 0).drop("_emp_termination_date")
+        zombie_count = evaluated_df.filter(is_zombie).count()
 
-    valid_df = (
-        evaluated_df.filter(F.size("dq_reasons") == 0)
-        .drop("dq_reasons", "_emp_termination_date")
-        .withColumn("_silver_updated_at", F.current_timestamp())
-        .select(*SILVER_TIMESHEETS_COLUMNS)
-    )
+        valid_df = (
+            evaluated_df.filter(F.size("dq_reasons") == 0)
+            .drop("dq_reasons", "_emp_termination_date")
+            .withColumn("_silver_updated_at", F.current_timestamp())
+            .select(*SILVER_TIMESHEETS_COLUMNS)
+        )
 
-    write_delta_partition(spark, valid_df, silver_path, iso_date)
-    write_quarantine(spark, quarantine_df, quarantine_path, iso_date)
+        write_delta_partition(spark, valid_df, silver_path, iso_date)
+        write_quarantine(spark, quarantine_df, quarantine_path, iso_date)
+    finally:
+        evaluated_df.unpersist()
 
     persisted_batch_df = (
         spark.read.format("delta")
         .load(silver_path)
         .filter(F.col("_batch_date") == F.to_date(F.lit(iso_date)))
     )
+    persisted_quarantine_df = (
+        spark.read.format("delta")
+        .load(quarantine_path)
+        .filter(F.col("_batch_date") == F.to_date(F.lit(iso_date)))
+    )
     valid_count = persisted_batch_df.count()
-    quarantined_count = quarantine_df.count()
+    quarantined_count = persisted_quarantine_df.count()
 
     dq_results = [
         check_expected_columns(
@@ -223,7 +231,7 @@ def transform_timesheets(
     write_audit_results(spark, dq_results, audit_path)
     enforce_dq_gate(dq_results)
 
-    return persisted_batch_df, quarantine_df
+    return persisted_batch_df, persisted_quarantine_df
 
 
 def run(
