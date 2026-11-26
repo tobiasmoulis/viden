@@ -183,13 +183,24 @@ with DAG(
                 '--batch-date "{{ ds }}" --run-id "{{ run_id }}"',
             ),
         )
-        # TODO: Replace with BashOperator once CRM & Surveys Silver PRs are merged.
-        transform_crm_events_todo = EmptyOperator(task_id="transform_crm_events_todo")
-        transform_surveys_todo = EmptyOperator(task_id="transform_surveys_todo")
+        transform_crm_events = BashOperator(
+            task_id="transform_crm_events",
+            bash_command=_spark_submit_cmd(
+                "/opt/workspace/spark_jobs/silver/transform_crm_events.py",
+                '--batch-date "{{ ds }}" --run-id "{{ run_id }}"',
+            ),
+        )
+        transform_surveys = BashOperator(
+            task_id="transform_surveys",
+            bash_command=_spark_submit_cmd(
+                "/opt/workspace/spark_jobs/silver/transform_surveys.py",
+                '--batch-date "{{ ds }}" --run-id "{{ run_id }}"',
+            ),
+        )
 
         transform_employees_scd2 >> transform_timesheets
         [transform_projects, transform_fx_rates] >> transform_invoices_expenses
-        transform_clients >> transform_crm_events_todo
+        transform_clients >> transform_crm_events
 
     dq_silver_gate = BashOperator(
         task_id="dq_silver_gate",

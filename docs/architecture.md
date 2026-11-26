@@ -164,25 +164,35 @@ All deduplication uses `Window.partitionBy(<business_key>).orderBy(...)` with `r
 
 ## 6. Spark Shuffle Skew Analysis (`crm_events` — `VIP_CORP_001`)
 
-`VIP_CORP_001` accounts for roughly **45%** (`19,151 / 42,507` in Days 1–14) of all `crm_events` rows, causing severe skew during distributed joins/aggregations against `silver_clients`.
+`VIP_CORP_001` accounts for **45.05%** (`19,151 / 42,507` in Days 1–14) of all `crm_events` rows, causing severe task skew during distributed joins against `silver_clients`.
 
-- **Planned Mitigation Strategy:** Broadcast Hash Join (`F.broadcast(silver_clients)`) for enriching `silver_crm_events` with the small 300-row `silver_clients` dimension, combined with Spark AQE (`spark.sql.adaptive.enabled=true`, `spark.sql.adaptive.skewJoin.enabled=true`) for downstream aggregations.
-- **Verification Plan (Phase 3):** Run baseline Sort-Merge Join (with `spark.sql.autoBroadcastJoinThreshold=-1` and AQE disabled) vs. optimized Broadcast Join on `spark-master`, then populate the table and screenshots below from the Spark History Server (`http://localhost:18080`).
+- **Mitigation Strategy Implemented (`spark_jobs/silver/transform_crm_events.py`):** Broadcast Hash Join (`F.broadcast(silver_clients)`) for enriching `silver_crm_events` with the small 300-row `silver_clients` dimension, combined with Spark AQE (`spark.sql.adaptive.enabled=true`, `spark.sql.adaptive.skewJoin.enabled=true`).
+- **Benchmark Setup (`spark://spark-master:7077`, 14-day `bronze/crm_events`, 42,507 events, `shuffle_partitions=8`):**
+  - **Baseline (`app-20261126154145-0001`, Stage 9):** Forced Sort-Merge Join (`spark.sql.autoBroadcastJoinThreshold=-1`, `spark.sql.adaptive.enabled=false`). One straggler partition received `VIP_CORP_001` (`21,929` records vs. median `2,855` — **7.7× record skew** and **8.8× task duration tail**).
+  - **Optimized (`app-20261126154235-0002`, Stage 14):** `F.broadcast(silver_clients)` eliminates the join shuffle completely; AQE coalesces the downstream aggregation shuffle to 1 task (`61.8 KB` total vs. `289.4 KB` baseline — **79% shuffle byte reduction** and **25× lower stage executor CPU time**).
 
 ### Before vs. After Skew Mitigation Metrics
 
 | Metric | Unoptimized (Skewed Shuffle Join) | Optimized (Broadcast Join + AQE) |
 | :--- | :---: | :---: |
-| **Strategy / Config** | Sort-Merge Join (`autoBroadcastJoinThreshold=-1`) | `F.broadcast(silver_clients)` + AQE |
-| **Stage Duration** | <!-- TODO (Phase 3) --> | <!-- TODO (Phase 3) --> |
-| **Max Task Duration vs. Median** | <!-- TODO (Phase 3) --> | <!-- TODO (Phase 3) --> |
-| **Max Shuffle Read Size per Task** | <!-- TODO (Phase 3) --> | <!-- TODO (Phase 3) --> |
-| **Spill (Memory / Disk)** | <!-- TODO (Phase 3) --> | <!-- TODO (Phase 3) --> |
+| **Strategy / Config** | Sort-Merge Join (`autoBroadcastJoinThreshold=-1`, AQE off) | `F.broadcast(silver_clients)` + AQE (`skewJoin.enabled=true`) |
+| **Spark App / Stage** | `app-20261126154145-0001` (Stage 9, 8 tasks) | `app-20261126154235-0002` (Stage 14, 1 AQE-coalesced task) |
+| **Stage Executor Run Time / Total Wall Clock** | `2,525 ms` / `40.13 s` | `100 ms` / `33.97 s` |
+| **Max Task Duration vs. Median** | `1,105 ms` vs. `126.0 ms` (**8.8× tail skew**) | `252 ms` vs. `252.0 ms` (**1.0×, zero skew**) |
+| **Max Shuffle Read per Task vs. Median** | `134.1 KB` (`21,929` recs) vs. median `2,855` recs (**7.7× skew**; `289.4 KB` total) | `61.8 KB` (`2,976` pre-agg recs total; **0 B join shuffle**, −79% total shuffle) |
+| **Spill (Memory / Disk)** | `0 B` / `0 B` | `0 B` / `0 B` |
 
 ### Spark UI Screenshots
 
-- **Baseline (Skewed):** `<!-- TODO (Phase 3): docs/images/crm_skew_baseline.png -->`
-- **Optimized:** `<!-- TODO (Phase 3): docs/images/crm_skew_optimized.png -->`
+Captured from the local Spark History Server (`http://localhost:18080`):
+
+- **Baseline (Skewed Sort-Merge Join — Stage 9):**
+
+  ![Baseline Skewed Sort-Merge Join Stage 9](./images/crm_skew_baseline.png)
+
+- **Optimized (Broadcast Join + AQE — Stage 14):**
+
+  ![Optimized Broadcast Join Stage 14](./images/crm_skew_optimized.png)
 
 ---
 
