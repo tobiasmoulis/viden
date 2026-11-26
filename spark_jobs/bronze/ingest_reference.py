@@ -1,25 +1,80 @@
-"""Bronze ingestion skeleton for `projects` and `survey_questions` (full-load reference datasets).
-
-TODO (Student Deliverable):
-1. Ingest `<landing_root>/projects/projects.csv` (header=True, explicit schema:
-   `project_id`, `client_id`, `budget_eur`, `status`).
-2. Ingest `<landing_root>/survey_questions/survey_questions.json` (multiline JSON array
-   of 10 question definitions: `question_id`, `dimension`, `scale_min`, `scale_max`,
-   `prompt_text`).
-3. Append standardized Bronze metadata (`_batch_date`, `_ingested_at`, `_source_file`).
-4. Write idempotently to `<lakehouse_root>/bronze/projects` and
-   `<lakehouse_root>/bronze/survey_questions` (Delta Lake).
-
-Reference: `docs/STUDENT_ASSIGNMENT.md` (Sections 3.1, 3.3, 4.2.A) and `docs/SANITY_CHECKS.md`.
-"""
+"""Bronze ingestion job for full-load reference datasets (`projects` and `survey_questions`)."""
 
 from __future__ import annotations
 
 import argparse
 
-from pyspark.sql import SparkSession
+from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql.types import DoubleType, IntegerType, StringType, StructField, StructType
 
-from spark_jobs.common.spark_session import get_spark_session
+from spark_jobs.common.io import add_bronze_metadata, write_delta_overwrite
+from spark_jobs.common.spark_session import (
+    get_lakehouse_root,
+    get_landing_root,
+    get_spark_session,
+    join_path,
+)
+
+PROJECTS_RAW_SCHEMA = StructType(
+    [
+        StructField("project_id", StringType(), nullable=True),
+        StructField("client_id", StringType(), nullable=True),
+        StructField("budget_eur", DoubleType(), nullable=True),
+        StructField("status", StringType(), nullable=True),
+    ]
+)
+
+SURVEY_QUESTIONS_RAW_SCHEMA = StructType(
+    [
+        StructField("question_id", StringType(), nullable=True),
+        StructField("dimension", StringType(), nullable=True),
+        StructField("scale_min", IntegerType(), nullable=True),
+        StructField("scale_max", IntegerType(), nullable=True),
+        StructField("prompt_text", StringType(), nullable=True),
+    ]
+)
+
+
+def ingest_projects(
+    spark: SparkSession,
+    batch_date: str,
+    landing_root: str | None = None,
+    lakehouse_root: str | None = None,
+) -> DataFrame:
+    """Read raw `projects.csv` and write idempotently to `bronze/projects` Delta."""
+    resolved_landing = get_landing_root(landing_root)
+    resolved_lakehouse = get_lakehouse_root(lakehouse_root)
+
+    source_path = join_path(resolved_landing, "projects", "projects.csv")
+    target_path = join_path(resolved_lakehouse, "bronze", "projects")
+
+    raw_df = spark.read.option("header", "true").schema(PROJECTS_RAW_SCHEMA).csv(source_path)
+    bronze_df = add_bronze_metadata(raw_df, batch_date)
+
+    write_delta_overwrite(bronze_df, target_path)
+    return bronze_df
+
+
+def ingest_survey_questions(
+    spark: SparkSession,
+    batch_date: str,
+    landing_root: str | None = None,
+    lakehouse_root: str | None = None,
+) -> DataFrame:
+    """Read raw `survey_questions.json` and write idempotently to `bronze/survey_questions`."""
+    resolved_landing = get_landing_root(landing_root)
+    resolved_lakehouse = get_lakehouse_root(lakehouse_root)
+
+    source_path = join_path(resolved_landing, "survey_questions", "survey_questions.json")
+    target_path = join_path(resolved_lakehouse, "bronze", "survey_questions")
+
+    raw_df = (
+        spark.read.option("multiLine", "true").schema(SURVEY_QUESTIONS_RAW_SCHEMA).json(source_path)
+    )
+    bronze_df = add_bronze_metadata(raw_df, batch_date)
+
+    write_delta_overwrite(bronze_df, target_path)
+    return bronze_df
 
 
 def run(
@@ -27,11 +82,25 @@ def run(
     batch_date: str,
     landing_root: str | None = None,
     lakehouse_root: str | None = None,
-) -> None:
-    """TODO: Implement Bronze ingestion for `projects` and `survey_questions`."""
-    raise NotImplementedError(
-        "TODO: Implement Bronze ingestion for projects & survey_questions (see ingest_clients.py)."
+) -> tuple[DataFrame, DataFrame]:
+    """Ingest `projects` and `survey_questions` full-load reference tables into Bronze."""
+    projects_df = ingest_projects(
+        spark,
+        batch_date=batch_date,
+        landing_root=landing_root,
+        lakehouse_root=lakehouse_root,
     )
+    questions_df = ingest_survey_questions(
+        spark,
+        batch_date=batch_date,
+        landing_root=landing_root,
+        lakehouse_root=lakehouse_root,
+    )
+    print(
+        f"Ingested bronze/projects={projects_df.count()}, "
+        f"bronze/survey_questions={questions_df.count()} for batch_date={batch_date}"
+    )
+    return projects_df, questions_df
 
 
 def parse_args() -> argparse.Namespace:
