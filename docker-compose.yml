@@ -84,12 +84,10 @@ services:
     image: spark-lakehouse-spark:3.5.5
     depends_on:
       - spark-master
-    command: >
-      /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker
-      spark://spark-master:7077
-      --webui-port 8081
-      --cores ${SPARK_WORKER_CORES:-2}
-      --memory ${SPARK_WORKER_MEMORY:-2G}
+    command:
+      - bash
+      - -c
+      - umask 000 && exec /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077 --webui-port 8081 --cores ${SPARK_WORKER_CORES:-2} --memory ${SPARK_WORKER_MEMORY:-2G}
     ports:
       - "8082:8081"
     environment:
@@ -104,7 +102,7 @@ services:
     command:
       - bash
       - -c
-      - mkdir -p /opt/workspace/lakehouse/spark-events && exec /opt/spark/bin/spark-class org.apache.spark.deploy.history.HistoryServer
+      - umask 000 && mkdir -p /opt/workspace/lakehouse/spark-events && exec /opt/spark/bin/spark-class org.apache.spark.deploy.history.HistoryServer
     ports:
       - "18080:18080"
     environment:

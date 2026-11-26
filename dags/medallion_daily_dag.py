@@ -1,9 +1,15 @@
-"""Parameterized daily Medallion Lakehouse DAG skeleton.
+"""Parameterized daily Medallion Lakehouse Airflow DAG.
 
-Reference pipeline (`clients` Bronze -> Silver) is wired end-to-end.
-Remaining domain tasks, DQ gates, Gold marts, and reporting refresh are
-scaffolded as `EmptyOperator` TODO placeholders matching the dependency graph
-in `docs/STUDENT_ASSIGNMENT.md` (Section 4.4).
+Wired end-to-end for:
+- Landing file sensor (`sense_landing_files` using `test -s` non-empty checks)
+- All 5 Bronze ingestion jobs (`bronze_ingest`)
+- Implemented Silver jobs (`clients`, `projects`, `employees_scd2`, `fx_rates`,
+  `timesheets`, `invoices_expenses`)
+- Centralized DQ gates (`dq_bronze_gate`, `dq_silver_gate`, `dq_gold_gate`)
+- Reporting Delta log readiness check (`refresh_reporting_layer`)
+
+Remaining CRM/Surveys Silver tasks and Gold mart tasks remain scaffolded as
+`EmptyOperator` placeholders until their feature PRs are merged.
 """
 
 from __future__ import annotations
@@ -33,6 +39,16 @@ def _on_task_failure(context: dict) -> None:
     )
 
 
+def _spark_submit_cmd(script_path: str, extra_args: str = "") -> str:
+    """Build a standardized `spark-submit` shell command with `umask 000`."""
+    cmd = (
+        "umask 000 && "
+        'spark-submit --master "${SPARK_MASTER_URL:-spark://spark-master:7077}" '
+        f"{script_path}"
+    )
+    return f"{cmd} {extra_args}" if extra_args else cmd
+
+
 DEFAULT_ARGS = {
     "owner": "data-engineering",
     "depends_on_past": False,
@@ -45,7 +61,7 @@ DEFAULT_ARGS = {
 
 with DAG(
     dag_id="medallion_daily_pipeline",
-    description="Parameterized daily Medallion Lakehouse pipeline (starter scaffold)",
+    description="Parameterized daily Medallion Lakehouse pipeline",
     default_args=DEFAULT_ARGS,
     schedule="@daily",
     start_date=datetime(2026, 1, 1),
@@ -67,11 +83,11 @@ with DAG(
             '"invoices/date=${DS}/part-000.jsonl" '
             '"expenses/date=${DS}/part-000.csv" '
             '"crm_events/date=${DS}/part-000.jsonl"; do '
-            'test -f "${ROOT}/${f}" || { echo "Missing ${f} in ${ROOT}"; exit 1; }; '
+            'test -s "${ROOT}/${f}" || { echo "Missing or empty ${f} in ${ROOT}"; exit 1; }; '
             "done && "
             'if [ "{{ logical_date.isoweekday() }}" -le 5 ]; then '
-            'test -f "${ROOT}/fx_rates/date=${DS}/part-000.json" '
-            '|| { echo "Missing weekday fx_rates for ${DS}"; exit 1; }; '
+            'test -s "${ROOT}/fx_rates/date=${DS}/part-000.json" '
+            '|| { echo "Missing or empty weekday fx_rates for ${DS}"; exit 1; }; '
             "fi"
         ),
     )
@@ -79,69 +95,109 @@ with DAG(
     with TaskGroup(group_id="bronze_ingest") as bronze_ingest:
         ingest_clients = BashOperator(
             task_id="ingest_clients",
-            bash_command=(
-                'spark-submit --master "${SPARK_MASTER_URL:-spark://spark-master:7077}" '
-                '/opt/workspace/spark_jobs/bronze/ingest_clients.py --batch-date "{{ ds }}"'
+            bash_command=_spark_submit_cmd(
+                "/opt/workspace/spark_jobs/bronze/ingest_clients.py",
+                '--batch-date "{{ ds }}"',
             ),
         )
         ingest_reference = BashOperator(
             task_id="ingest_reference",
-            bash_command=(
-                'spark-submit --master "${SPARK_MASTER_URL:-spark://spark-master:7077}" '
-                '/opt/workspace/spark_jobs/bronze/ingest_reference.py --batch-date "{{ ds }}"'
+            bash_command=_spark_submit_cmd(
+                "/opt/workspace/spark_jobs/bronze/ingest_reference.py",
+                '--batch-date "{{ ds }}"',
             ),
         )
         ingest_hr = BashOperator(
             task_id="ingest_hr",
-            bash_command=(
-                'spark-submit --master "${SPARK_MASTER_URL:-spark://spark-master:7077}" '
-                '/opt/workspace/spark_jobs/bronze/ingest_hr.py --batch-date "{{ ds }}"'
+            bash_command=_spark_submit_cmd(
+                "/opt/workspace/spark_jobs/bronze/ingest_hr.py",
+                '--batch-date "{{ ds }}"',
             ),
         )
         ingest_finance = BashOperator(
             task_id="ingest_finance",
-            bash_command=(
-                'spark-submit --master "${SPARK_MASTER_URL:-spark://spark-master:7077}" '
-                '/opt/workspace/spark_jobs/bronze/ingest_finance.py --batch-date "{{ ds }}"'
+            bash_command=_spark_submit_cmd(
+                "/opt/workspace/spark_jobs/bronze/ingest_finance.py",
+                '--batch-date "{{ ds }}"',
             ),
         )
         ingest_crm_surveys = BashOperator(
             task_id="ingest_crm_surveys",
-            bash_command=(
-                'spark-submit --master "${SPARK_MASTER_URL:-spark://spark-master:7077}" '
-                '/opt/workspace/spark_jobs/bronze/ingest_crm_surveys.py --batch-date "{{ ds }}"'
+            bash_command=_spark_submit_cmd(
+                "/opt/workspace/spark_jobs/bronze/ingest_crm_surveys.py",
+                '--batch-date "{{ ds }}"',
             ),
         )
 
-    # TODO: Wire Bronze DQ gate validating mandatory daily partitions & row counts.
-    dq_bronze_gate = EmptyOperator(task_id="dq_bronze_gate")
+    dq_bronze_gate = BashOperator(
+        task_id="dq_bronze_gate",
+        bash_command=_spark_submit_cmd(
+            "/opt/workspace/dq/run_gate.py",
+            '--layer bronze --batch-date "{{ ds }}" --run-id "{{ run_id }}"',
+        ),
+    )
 
     with TaskGroup(group_id="silver_transform") as silver_transform:
         # Dimensions & FX rates
         transform_clients = BashOperator(
             task_id="transform_clients",
-            bash_command=(
-                'spark-submit --master "${SPARK_MASTER_URL:-spark://spark-master:7077}" '
-                "/opt/workspace/spark_jobs/silver/transform_clients.py "
-                '--batch-date "{{ ds }}" --run-id "{{ run_id }}"'
+            bash_command=_spark_submit_cmd(
+                "/opt/workspace/spark_jobs/silver/transform_clients.py",
+                '--batch-date "{{ ds }}" --run-id "{{ run_id }}"',
             ),
         )
-        # TODO: Replace placeholders with actual Silver PySpark tasks.
-        transform_employees_scd2_todo = EmptyOperator(task_id="transform_employees_scd2_todo")
-        transform_fx_rates_todo = EmptyOperator(task_id="transform_fx_rates_todo")
+        transform_projects = BashOperator(
+            task_id="transform_projects",
+            bash_command=_spark_submit_cmd(
+                "/opt/workspace/spark_jobs/silver/transform_projects.py",
+                '--batch-date "{{ ds }}" --run-id "{{ run_id }}"',
+            ),
+        )
+        transform_employees_scd2 = BashOperator(
+            task_id="transform_employees_scd2",
+            bash_command=_spark_submit_cmd(
+                "/opt/workspace/spark_jobs/silver/transform_employees_scd2.py",
+                '--batch-date "{{ ds }}" --run-id "{{ run_id }}"',
+            ),
+        )
+        transform_fx_rates = BashOperator(
+            task_id="transform_fx_rates",
+            bash_command=_spark_submit_cmd(
+                "/opt/workspace/spark_jobs/silver/transform_fx_rates.py",
+                '--batch-date "{{ ds }}" --run-id "{{ run_id }}"',
+            ),
+        )
 
         # Facts & Surveys (depend on conformed dimensions / FX rates)
-        transform_timesheets_todo = EmptyOperator(task_id="transform_timesheets_todo")
-        transform_invoices_expenses_todo = EmptyOperator(task_id="transform_invoices_expenses_todo")
+        transform_timesheets = BashOperator(
+            task_id="transform_timesheets",
+            bash_command=_spark_submit_cmd(
+                "/opt/workspace/spark_jobs/silver/transform_timesheets.py",
+                '--batch-date "{{ ds }}" --run-id "{{ run_id }}"',
+            ),
+        )
+        transform_invoices_expenses = BashOperator(
+            task_id="transform_invoices_expenses",
+            bash_command=_spark_submit_cmd(
+                "/opt/workspace/spark_jobs/silver/transform_invoices_expenses.py",
+                '--batch-date "{{ ds }}" --run-id "{{ run_id }}"',
+            ),
+        )
+        # TODO: Replace with BashOperator once CRM & Surveys Silver PRs are merged.
         transform_crm_events_todo = EmptyOperator(task_id="transform_crm_events_todo")
         transform_surveys_todo = EmptyOperator(task_id="transform_surveys_todo")
 
-        transform_employees_scd2_todo >> transform_timesheets_todo
-        transform_fx_rates_todo >> transform_invoices_expenses_todo
+        transform_employees_scd2 >> transform_timesheets
+        [transform_projects, transform_fx_rates] >> transform_invoices_expenses
         transform_clients >> transform_crm_events_todo
 
-    # TODO: Wire Silver DQ gate (SCD2 no-overlap, zero NULL EUR amounts, quarantine warn ratio).
-    dq_silver_gate = EmptyOperator(task_id="dq_silver_gate")
+    dq_silver_gate = BashOperator(
+        task_id="dq_silver_gate",
+        bash_command=_spark_submit_cmd(
+            "/opt/workspace/dq/run_gate.py",
+            '--layer silver --batch-date "{{ ds }}" --run-id "{{ run_id }}"',
+        ),
+    )
 
     with TaskGroup(group_id="gold_marts") as gold_marts:
         # TODO: Replace placeholders with parallel Gold mart PySpark tasks.
@@ -153,11 +209,24 @@ with DAG(
             task_id="gold_employee_churn_features_todo"
         )
 
-    # TODO: Wire Gold DQ gate validating Gold mart schemas, primary keys & KPI sanity bounds.
-    dq_gold_gate = EmptyOperator(task_id="dq_gold_gate")
+    dq_gold_gate = BashOperator(
+        task_id="dq_gold_gate",
+        bash_command=_spark_submit_cmd(
+            "/opt/workspace/dq/run_gate.py",
+            '--layer gold --batch-date "{{ ds }}" --run-id "{{ run_id }}"',
+        ),
+    )
 
-    # TODO: Implement reporting cache/view refresh or verification check if applicable.
-    refresh_reporting_layer = EmptyOperator(task_id="refresh_reporting_layer")
+    # Verify Delta log availability for reporting tables (add mandatory gold/* checks as built).
+    refresh_reporting_layer = BashOperator(
+        task_id="refresh_reporting_layer",
+        bash_command=(
+            'LAKEHOUSE="${LAKEHOUSE_ROOT:-/opt/workspace/lakehouse}" && '
+            'test -d "${LAKEHOUSE}/dq/dq_audit_results/_delta_log" '
+            '|| { echo "Missing dq_audit_results Delta log"; exit 1; } && '
+            'echo "Reporting layer Delta tables verified under ${LAKEHOUSE}"'
+        ),
+    )
 
     (
         sense_landing_files
