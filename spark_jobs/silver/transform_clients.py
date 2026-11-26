@@ -14,11 +14,11 @@ from __future__ import annotations
 import argparse
 import uuid
 
-from delta.tables import DeltaTable
-from pyspark.sql import Column, DataFrame, SparkSession, Window
+from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 
 from dq.framework import check_not_null, enforce_dq_gate, write_audit_results
+from spark_jobs.common.io import clean_str, write_delta_overwrite, write_quarantine
 from spark_jobs.common.spark_session import (
     get_lakehouse_root,
     get_spark_session,
@@ -26,11 +26,6 @@ from spark_jobs.common.spark_session import (
 )
 
 VALID_CLIENT_TIERS = ("Standard", "Silver", "Gold", "Enterprise")
-
-
-def _clean_str(column_name: str) -> Column:
-    trimmed = F.trim(F.col(column_name))
-    return F.when(F.length(trimmed) == 0, F.lit(None).cast("string")).otherwise(trimmed)
 
 
 def transform_clients(
@@ -51,9 +46,9 @@ def transform_clients(
     bronze_df = spark.read.format("delta").load(bronze_path)
 
     normalized_df = (
-        bronze_df.withColumn("client_id", _clean_str("client_id"))
-        .withColumn("client_name", _clean_str("client_name"))
-        .withColumn("tier", _clean_str("tier"))
+        bronze_df.withColumn("client_id", clean_str("client_id"))
+        .withColumn("client_name", clean_str("client_name"))
+        .withColumn("tier", clean_str("tier"))
         .withColumn("_batch_date", F.to_date(F.lit(batch_date)))
     )
 
@@ -85,30 +80,10 @@ def transform_clients(
     )
 
     # Write cleansed Silver table idempotently (full-load dimension overwrite).
-    (
-        valid_df.write.format("delta")
-        .mode("overwrite")
-        .option("overwriteSchema", "true")
-        .save(silver_path)
-    )
+    write_delta_overwrite(valid_df, silver_path)
 
     # Write quarantine table idempotently by `_batch_date`.
-    if DeltaTable.isDeltaTable(spark, quarantine_path):
-        DeltaTable.forPath(spark, quarantine_path).delete(f"_batch_date = DATE '{batch_date}'")
-        if not quarantine_df.isEmpty():
-            (
-                quarantine_df.write.format("delta")
-                .mode("append")
-                .partitionBy("_batch_date")
-                .save(quarantine_path)
-            )
-    else:
-        (
-            quarantine_df.write.format("delta")
-            .mode("overwrite")
-            .partitionBy("_batch_date")
-            .save(quarantine_path)
-        )
+    write_quarantine(spark, quarantine_df, quarantine_path, batch_date)
 
     # Sample Data Quality check & audit persistence.
     dq_result = check_not_null(

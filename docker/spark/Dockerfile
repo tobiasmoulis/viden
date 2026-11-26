@@ -40,6 +40,7 @@ RUN mkdir -p /opt/workspace /opt/workspace/lakehouse/spark-events && \
 WORKDIR /opt/workspace
 
 ENV SPARK_HOME=/opt/spark
+ENV PATH="/opt/spark/bin:${PATH}"
 ENV PYTHONPATH=/opt/workspace
 
 USER spark

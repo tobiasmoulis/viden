@@ -18,9 +18,9 @@ from __future__ import annotations
 import argparse
 
 from pyspark.sql import DataFrame, SparkSession
-from pyspark.sql import functions as F
 from pyspark.sql.types import StringType, StructField, StructType
 
+from spark_jobs.common.io import add_bronze_metadata, write_delta_overwrite
 from spark_jobs.common.spark_session import (
     get_lakehouse_root,
     get_landing_root,
@@ -51,19 +51,9 @@ def ingest_clients(
     target_path = join_path(resolved_lakehouse, "bronze", "clients")
 
     raw_df = spark.read.option("header", "true").schema(CLIENTS_RAW_SCHEMA).csv(source_path)
+    bronze_df = add_bronze_metadata(raw_df, batch_date)
 
-    bronze_df = (
-        raw_df.withColumn("_batch_date", F.to_date(F.lit(batch_date)))
-        .withColumn("_ingested_at", F.current_timestamp())
-        .withColumn("_source_file", F.input_file_name())
-    )
-
-    (
-        bronze_df.write.format("delta")
-        .mode("overwrite")
-        .option("overwriteSchema", "true")
-        .save(target_path)
-    )
+    write_delta_overwrite(bronze_df, target_path)
     return bronze_df
 
 
