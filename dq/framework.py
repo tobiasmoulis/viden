@@ -69,6 +69,41 @@ def _escape_sql_literal(value: str) -> str:
     return value.replace("'", "''")
 
 
+def build_dq_result(
+    *,
+    run_id: str,
+    batch_date: str | date,
+    layer: str,
+    table_name: str,
+    check_name: str,
+    severity: str,
+    passed: bool,
+    failed_count: int,
+    total_count: int,
+) -> DQCheckResult:
+    """Build a standardized DQCheckResult with consistent PASS / WARN / FAIL status."""
+    sev = severity.upper()
+    if passed:
+        status = "PASS"
+    elif sev == "WARN":
+        status = "WARN"
+    else:
+        status = "FAIL"
+
+    return DQCheckResult(
+        run_id=run_id,
+        batch_date=_parse_batch_date(batch_date),
+        layer=layer,
+        table_name=table_name,
+        check_name=check_name,
+        severity=sev,
+        status=status,
+        failed_count=int(failed_count),
+        total_count=int(total_count),
+        checked_at=datetime.now(timezone.utc),
+    )
+
+
 def check_not_null(
     df: DataFrame,
     column_name: str,
@@ -79,29 +114,45 @@ def check_not_null(
     table_name: str,
     severity: str = "ERROR",
 ) -> DQCheckResult:
-    """Verify that `column_name` contains no NULL values (reference sample check)."""
-    parsed_date = _parse_batch_date(batch_date)
+    """Verify that `column_name` contains no NULL values."""
     total_count = df.count()
     failed_count = df.filter(F.col(column_name).isNull()).count()
-
-    if failed_count == 0:
-        status = "PASS"
-    elif severity.upper() == "WARN":
-        status = "WARN"
-    else:
-        status = "FAIL"
-
-    return DQCheckResult(
+    return build_dq_result(
         run_id=run_id,
-        batch_date=parsed_date,
+        batch_date=batch_date,
         layer=layer,
         table_name=table_name,
         check_name=f"not_null_{column_name}",
-        severity=severity.upper(),
-        status=status,
+        severity=severity,
+        passed=failed_count == 0,
         failed_count=failed_count,
         total_count=total_count,
-        checked_at=datetime.now(timezone.utc),
+    )
+
+
+def check_expected_columns(
+    df: DataFrame,
+    expected_columns: Sequence[str],
+    *,
+    run_id: str,
+    batch_date: str | date,
+    layer: str,
+    table_name: str,
+    severity: str = "ERROR",
+) -> DQCheckResult:
+    """Verify that all expected columns are present in the DataFrame schema."""
+    actual = set(df.columns)
+    missing = [col for col in expected_columns if col not in actual]
+    return build_dq_result(
+        run_id=run_id,
+        batch_date=batch_date,
+        layer=layer,
+        table_name=table_name,
+        check_name="expected_schema_columns",
+        severity=severity,
+        passed=len(missing) == 0,
+        failed_count=len(missing),
+        total_count=len(expected_columns),
     )
 
 
