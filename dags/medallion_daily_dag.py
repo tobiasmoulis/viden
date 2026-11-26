@@ -3,13 +3,13 @@
 Wired end-to-end for:
 - Landing file sensor (`sense_landing_files` using `test -s` non-empty checks)
 - All 5 Bronze ingestion jobs (`bronze_ingest`)
-- Implemented Silver jobs (`clients`, `projects`, `employees_scd2`, `fx_rates`,
-  `timesheets`, `invoices_expenses`)
+- All 8 Silver transformation jobs (`clients`, `projects`, `employees_scd2`,
+  `fx_rates`, `timesheets`, `invoices_expenses`, `crm_events`, `surveys`)
 - Centralized DQ gates (`dq_bronze_gate`, `dq_silver_gate`, `dq_gold_gate`)
 - Reporting Delta log readiness check (`refresh_reporting_layer`)
 
-Remaining CRM/Surveys Silver tasks and Gold mart tasks remain scaffolded as
-`EmptyOperator` placeholders until their feature PRs are merged.
+Remaining Gold mart tasks remain scaffolded as `EmptyOperator` placeholders
+until their feature PRs are merged.
 """
 
 from __future__ import annotations

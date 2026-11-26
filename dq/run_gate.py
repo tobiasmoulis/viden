@@ -71,6 +71,7 @@ SILVER_MANDATORY_SPECS: tuple[dict, ...] = (
         "pk": ("rate_date", "currency_from", "currency_to"),
         "partitioned": False,
         "not_null_cols": ("rate",),
+        "freshness_date_col": "rate_date",
     },
     {
         "table": "silver_timesheets",
@@ -93,18 +94,21 @@ SILVER_MANDATORY_SPECS: tuple[dict, ...] = (
         "table": "silver_crm_events",
         "pk": ("event_id",),
         "partitioned": True,
+        "not_null_cols": ("client_id", "event_timestamp"),
     },
     {
         "table": "silver_survey_responses",
         "pk": ("survey_id",),
         "partitioned": True,
         "allow_empty": True,
+        "not_null_cols": ("emp_id", "submitted_at"),
     },
     {
         "table": "silver_survey_answers",
         "pk": ("survey_id", "question_id"),
         "partitioned": True,
         "allow_empty": True,
+        "not_null_cols": ("numeric_score",),
     },
 )
 
@@ -379,6 +383,23 @@ def _validate_silver_spec(
                 layer="silver",
                 table_name=table,
                 severity="ERROR",
+            )
+        )
+
+    freshness_col = spec.get("freshness_date_col")
+    if freshness_col:
+        day_rows = df.filter(F.col(freshness_col) == F.to_date(F.lit(iso_date))).count()
+        table_results.append(
+            build_dq_result(
+                run_id=resolved_run_id,
+                batch_date=iso_date,
+                layer="silver",
+                table_name=table,
+                check_name=f"gate_freshness_{freshness_col}",
+                severity="ERROR",
+                passed=day_rows > 0,
+                failed_count=0 if day_rows > 0 else 1,
+                total_count=day_rows,
             )
         )
 

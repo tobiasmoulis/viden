@@ -65,6 +65,7 @@ def get_spark_session(
         )
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.shuffle.partitions", str(resolved_shuffle))
+        .config("spark.databricks.delta.snapshotPartitions", str(resolved_shuffle))
     )
 
     s3_endpoint = os.getenv("S3_ENDPOINT_URL", "").strip()

@@ -2,14 +2,14 @@
 
 Implements:
 - UTC `TIMESTAMP` parsing (`event_timestamp`, `event_date`)
-- Polymorphic JSON `payload` extraction across all 5 `event_type` variants
-  (`page_view`, `support_ticket`, `contract_renewal`, `api_call`, `meeting_logged`)
-  while preserving `payload_raw`
+- Polymorphic JSON `payload` validation (`invalid_payload_json`) and extraction across
+  all 5 `event_type` variants (`page_view`, `support_ticket`, `contract_renewal`,
+  `api_call`, `meeting_logged`) while preserving `payload_raw`
 - Explicit skew-handling join with `silver_clients` (`F.broadcast` + Spark AQE) to
-  mitigate `VIP_CORP_001` (~45% of all CRM events); supports `--skew-strategy sort_merge`
-  for capturing unoptimized baseline Spark UI metrics
+  mitigate `VIP_CORP_001` (~45% of all CRM events) and quarantine `orphan_client_id`;
+  supports `--skew-strategy sort_merge` for baseline Spark UI benchmarks
 - Quarantine routing (`silver_quarantine/crm_events`), idempotent `_batch_date` writes,
-  and DQ audit persistence
+  and full job-level DQ audit persistence
 """
 
 from __future__ import annotations
@@ -19,9 +19,16 @@ import uuid
 
 from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
-from pyspark.sql.types import DoubleType, IntegerType, StringType, StructField, StructType
+from pyspark.sql.types import (
+    DoubleType,
+    IntegerType,
+    MapType,
+    StringType,
+    StructField,
+    StructType,
+)
 
-from dq.checks import check_quarantine_ratio, check_unique_key
+from dq.checks import check_non_empty_partition, check_quarantine_ratio, check_unique_key
 from dq.framework import (
     check_expected_columns,
     check_not_null,
@@ -138,6 +145,9 @@ def transform_crm_events(
     if skew_strategy == "broadcast":
         spark.conf.set("spark.sql.adaptive.enabled", "true")
         spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
+    else:
+        spark.conf.set("spark.sql.adaptive.enabled", "false")
+        spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "false")
 
     bronze_df = (
         spark.read.format("delta")
@@ -149,40 +159,16 @@ def transform_crm_events(
         clean_str("event_id").alias("event_id"),
         clean_str("client_id").alias("client_id"),
         clean_str("event_type").alias("event_type"),
+        clean_str("timestamp").alias("_raw_timestamp"),
         F.to_timestamp(clean_str("timestamp")).alias("event_timestamp"),
-        F.col("payload").alias("payload_raw"),
+        clean_str("payload").alias("payload_raw"),
         F.col("_batch_date"),
         F.col("_ingested_at"),
         F.col("_source_file"),
     )
 
-    reason_exprs = F.array(
-        F.when(F.col("event_id").isNull(), F.lit("missing_event_id")),
-        F.when(F.col("client_id").isNull(), F.lit("missing_client_id")),
-        F.when(
-            F.col("event_type").isNull() | (~F.col("event_type").isin(*VALID_EVENT_TYPES)),
-            F.lit("invalid_event_type"),
-        ),
-        F.when(F.col("event_timestamp").isNull(), F.lit("invalid_timestamp")),
-    )
-    evaluated_df = normalized_df.withColumn(
-        "dq_reasons", F.filter(reason_exprs, lambda reason: reason.isNotNull())
-    )
-
-    quarantine_df = evaluated_df.filter(F.size("dq_reasons") > 0)
-
-    dedup_window = Window.partitionBy("event_id").orderBy(
-        F.col("_ingested_at").desc(),
-        F.col("event_timestamp").asc(),
-    )
-    valid_events_df = (
-        evaluated_df.filter(F.size("dq_reasons") == 0)
-        .drop("dq_reasons")
-        .withColumn("_rn", F.row_number().over(dedup_window))
-        .filter(F.col("_rn") == 1)
-        .drop("_rn")
-    )
-
+    # Skew-mitigated join with `silver_clients` BEFORE quarantine split so orphan clients
+    # are routed to `silver_quarantine/crm_events` instead of leaking NULL attributes.
     clients_dim_df = (
         spark.read.format("delta")
         .load(clients_path)
@@ -190,65 +176,109 @@ def transform_crm_events(
             F.col("client_id"),
             F.col("client_name"),
             F.col("tier").alias("client_tier"),
+            F.lit(True).alias("_client_matched"),
         )
     )
-
-    # Skew mitigation for VIP_CORP_001 (~45% of all CRM events):
-    # Broadcast the small 300-row clients dimension to avoid shuffle skew entirely.
     rhs_clients = (
         F.broadcast(clients_dim_df)
         if skew_strategy == "broadcast"
         else clients_dim_df.hint("merge")
     )
-    enriched_df = valid_events_df.join(rhs_clients, on="client_id", how="left")
+    enriched_df = normalized_df.join(rhs_clients, on="client_id", how="left")
 
-    parsed_df = enriched_df.withColumn(
-        "_parsed_payload", F.from_json(F.col("payload_raw"), CRM_PAYLOAD_SCHEMA)
+    payload_map_type = MapType(StringType(), StringType())
+    invalid_payload = (
+        F.col("payload_raw").isNull() | F.from_json(F.col("payload_raw"), payload_map_type).isNull()
     )
 
-    silver_df = parsed_df.select(
-        F.col("event_id"),
-        F.col("client_id"),
-        F.col("client_name"),
-        F.col("client_tier"),
-        F.col("event_type"),
-        F.col("event_timestamp"),
-        F.to_date(F.col("event_timestamp")).alias("event_date"),
-        F.col("payload_raw"),
-        F.col("_parsed_payload.path").alias("path"),
-        F.col("_parsed_payload.referrer").alias("referrer"),
-        F.col("_parsed_payload.duration_sec").alias("duration_sec"),
-        F.col("_parsed_payload.device").alias("device"),
-        F.col("_parsed_payload.ticket_id").alias("ticket_id"),
-        F.col("_parsed_payload.severity").alias("severity"),
-        F.col("_parsed_payload.module").alias("module"),
-        F.col("_parsed_payload.sla_hours").alias("sla_hours"),
-        F.col("_parsed_payload.opportunity_id").alias("opportunity_id"),
-        F.col("_parsed_payload.stage").alias("stage"),
-        F.col("_parsed_payload.arr_delta_eur").alias("arr_delta_eur"),
-        F.col("_parsed_payload.probability").alias("probability"),
-        F.col("_parsed_payload.endpoint").alias("endpoint"),
-        F.col("_parsed_payload.status_code").alias("status_code"),
-        F.col("_parsed_payload.latency_ms").alias("latency_ms"),
-        F.col("_parsed_payload.region").alias("region"),
-        F.col("_parsed_payload.meeting_type").alias("meeting_type"),
-        F.col("_parsed_payload.attendees_count").alias("attendees_count"),
-        F.col("_parsed_payload.outcome").alias("outcome"),
-        F.col("_parsed_payload.next_step_days").alias("next_step_days"),
-        F.col("_batch_date"),
-        F.current_timestamp().alias("_silver_updated_at"),
+    reason_exprs = F.array(
+        F.when(F.col("event_id").isNull(), F.lit("missing_event_id")),
+        F.when(F.col("client_id").isNull(), F.lit("missing_client_id")),
+        F.when(
+            F.col("client_id").isNotNull() & F.col("_client_matched").isNull(),
+            F.lit("orphan_client_id"),
+        ),
+        F.when(
+            F.col("event_type").isNull() | (~F.col("event_type").isin(*VALID_EVENT_TYPES)),
+            F.lit("invalid_event_type"),
+        ),
+        F.when(F.col("event_timestamp").isNull(), F.lit("invalid_timestamp")),
+        F.when(invalid_payload, F.lit("invalid_payload_json")),
     )
+    evaluated_df = enriched_df.withColumn(
+        "dq_reasons", F.filter(reason_exprs, lambda reason: reason.isNotNull())
+    ).persist()
 
-    write_delta_partition(spark, silver_df, silver_path, iso_date)
-    write_quarantine(spark, quarantine_df, quarantine_path, iso_date)
+    try:
+        quarantine_df = evaluated_df.filter(F.size("dq_reasons") > 0).drop("_client_matched")
+
+        dedup_window = Window.partitionBy("event_id").orderBy(
+            F.col("event_timestamp").desc(),
+            F.col("_ingested_at").desc(),
+            F.col("payload_raw").asc_nulls_last(),
+        )
+        valid_events_df = (
+            evaluated_df.filter(F.size("dq_reasons") == 0)
+            .drop("dq_reasons", "_client_matched", "_raw_timestamp")
+            .withColumn("_rn", F.row_number().over(dedup_window))
+            .filter(F.col("_rn") == 1)
+            .drop("_rn")
+        )
+
+        parsed_df = valid_events_df.withColumn(
+            "_parsed_payload", F.from_json(F.col("payload_raw"), CRM_PAYLOAD_SCHEMA)
+        )
+
+        silver_df = parsed_df.select(
+            F.col("event_id"),
+            F.col("client_id"),
+            F.col("client_name"),
+            F.col("client_tier"),
+            F.col("event_type"),
+            F.col("event_timestamp"),
+            F.to_date(F.col("event_timestamp")).alias("event_date"),
+            F.col("payload_raw"),
+            F.col("_parsed_payload.path").alias("path"),
+            F.col("_parsed_payload.referrer").alias("referrer"),
+            F.col("_parsed_payload.duration_sec").alias("duration_sec"),
+            F.col("_parsed_payload.device").alias("device"),
+            F.col("_parsed_payload.ticket_id").alias("ticket_id"),
+            F.col("_parsed_payload.severity").alias("severity"),
+            F.col("_parsed_payload.module").alias("module"),
+            F.col("_parsed_payload.sla_hours").alias("sla_hours"),
+            F.col("_parsed_payload.opportunity_id").alias("opportunity_id"),
+            F.col("_parsed_payload.stage").alias("stage"),
+            F.col("_parsed_payload.arr_delta_eur").alias("arr_delta_eur"),
+            F.col("_parsed_payload.probability").alias("probability"),
+            F.col("_parsed_payload.endpoint").alias("endpoint"),
+            F.col("_parsed_payload.status_code").alias("status_code"),
+            F.col("_parsed_payload.latency_ms").alias("latency_ms"),
+            F.col("_parsed_payload.region").alias("region"),
+            F.col("_parsed_payload.meeting_type").alias("meeting_type"),
+            F.col("_parsed_payload.attendees_count").alias("attendees_count"),
+            F.col("_parsed_payload.outcome").alias("outcome"),
+            F.col("_parsed_payload.next_step_days").alias("next_step_days"),
+            F.col("_batch_date"),
+            F.current_timestamp().alias("_silver_updated_at"),
+        )
+
+        write_delta_partition(spark, silver_df, silver_path, iso_date)
+        write_quarantine(spark, quarantine_df, quarantine_path, iso_date)
+    finally:
+        evaluated_df.unpersist()
 
     persisted_batch_df = (
         spark.read.format("delta")
         .load(silver_path)
         .filter(F.col("_batch_date") == F.to_date(F.lit(iso_date)))
     )
+    persisted_quarantine_df = (
+        spark.read.format("delta")
+        .load(quarantine_path)
+        .filter(F.col("_batch_date") == F.to_date(F.lit(iso_date)))
+    )
     valid_count = persisted_batch_df.count()
-    quarantined_count = quarantine_df.count()
+    quarantined_count = persisted_quarantine_df.count()
 
     dq_results = [
         check_expected_columns(
@@ -260,9 +290,35 @@ def transform_crm_events(
             table_name="silver_crm_events",
             severity="ERROR",
         ),
+        check_non_empty_partition(
+            persisted_batch_df,
+            run_id=resolved_run_id,
+            batch_date=iso_date,
+            layer="silver",
+            table_name="silver_crm_events",
+            severity="ERROR",
+        ),
         check_not_null(
             persisted_batch_df,
             "event_id",
+            run_id=resolved_run_id,
+            batch_date=iso_date,
+            layer="silver",
+            table_name="silver_crm_events",
+            severity="ERROR",
+        ),
+        check_not_null(
+            persisted_batch_df,
+            "client_id",
+            run_id=resolved_run_id,
+            batch_date=iso_date,
+            layer="silver",
+            table_name="silver_crm_events",
+            severity="ERROR",
+        ),
+        check_not_null(
+            persisted_batch_df,
+            "event_timestamp",
             run_id=resolved_run_id,
             batch_date=iso_date,
             layer="silver",
@@ -292,7 +348,7 @@ def transform_crm_events(
     write_audit_results(spark, dq_results, audit_path)
     enforce_dq_gate(dq_results)
 
-    return persisted_batch_df, quarantine_df
+    return persisted_batch_df, persisted_quarantine_df
 
 
 def run(
@@ -339,6 +395,7 @@ if __name__ == "__main__":
         {
             "spark.sql.autoBroadcastJoinThreshold": "-1",
             "spark.sql.adaptive.enabled": "false",
+            "spark.sql.adaptive.skewJoin.enabled": "false",
         }
         if args.skew_strategy == "sort_merge"
         else {

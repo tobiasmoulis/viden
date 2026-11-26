@@ -76,17 +76,24 @@ def transform_fx_rates(
     quarantine_path = join_path(resolved_lakehouse, "silver_quarantine", "fx_rates")
     audit_path = join_path(resolved_lakehouse, "dq", "dq_audit_results")
 
-    bronze_df = (
-        spark.read.format("delta")
-        .load(bronze_path)
-        .filter(F.col("_batch_date") <= F.to_date(F.lit(iso_date)))
+    # Preserve later FX history when re-running an earlier `batch_date`.
+    bronze_all_df = spark.read.format("delta").load(bronze_path)
+    max_bronze_row = bronze_all_df.agg(F.max("_batch_date").alias("max_bd")).first()
+    max_bronze_date = max_bronze_row["max_bd"] if max_bronze_row is not None else None
+    effective_end_date = max(end_date, max_bronze_date) if max_bronze_date else end_date
+
+    bronze_df = bronze_all_df.filter(
+        F.col("_batch_date") <= F.to_date(F.lit(effective_end_date.isoformat()))
     )
 
+    cleaned_rate_date = clean_str("rate_date")
+    parsed_rate_date = F.when(
+        cleaned_rate_date.rlike(r"^\d{4}-\d{2}-\d{2}$"),
+        F.to_date(cleaned_rate_date, "yyyy-MM-dd"),
+    ).otherwise(F.lit(None).cast("date"))
+
     normalized_df = bronze_df.select(
-        F.coalesce(
-            F.to_date(clean_str("rate_date"), "yyyy-MM-dd"),
-            F.col("_batch_date"),
-        ).alias("rate_date"),
+        F.coalesce(parsed_rate_date, F.col("_batch_date")).alias("rate_date"),
         F.upper(clean_str("currency_from")).alias("currency_from"),
         F.upper(clean_str("currency_to")).alias("currency_to"),
         F.col("rate").cast("double").alias("raw_rate"),
@@ -102,62 +109,65 @@ def transform_fx_rates(
     )
     evaluated_df = normalized_df.withColumn(
         "dq_reasons", F.filter(reason_exprs, lambda reason: reason.isNotNull())
-    )
+    ).persist()
 
-    quarantine_df = evaluated_df.filter(
-        (F.size("dq_reasons") > 0) & (F.col("_batch_date") == F.to_date(F.lit(iso_date)))
-    )
-
-    dedup_window = Window.partitionBy("rate_date", "currency_from", "currency_to").orderBy(
-        F.col("_ingested_at").desc(),
-        F.col("raw_rate").asc(),
-    )
-    valid_raw_df = (
-        evaluated_df.filter(F.size("dq_reasons") == 0)
-        .drop("dq_reasons")
-        .withColumn("_rn", F.row_number().over(dedup_window))
-        .filter(F.col("_rn") == 1)
-        .drop("_rn")
-        .select("rate_date", "currency_from", "currency_to", "raw_rate")
-    )
-
-    min_date_row = valid_raw_df.agg(F.min("rate_date").alias("min_date")).first()
-    start_date = min_date_row["min_date"] if min_date_row is not None else None
-    if start_date is None:
-        raise ValueError(f"No valid bronze/fx_rates records found on or before {iso_date}")
-
-    calendar_spine_df = spark.sql(
-        f"SELECT explode(sequence(DATE '{start_date.isoformat()}', "
-        f"DATE '{iso_date}', INTERVAL 1 DAY)) AS rate_date"
-    )
-    canonical_pairs_df = spark.createDataFrame(
-        list(CANONICAL_CURRENCY_PAIRS), schema=CURRENCY_PAIR_SCHEMA
-    )
-    pairs_df = canonical_pairs_df.unionByName(
-        valid_raw_df.select("currency_from", "currency_to").distinct()
-    ).distinct()
-
-    spine_df = calendar_spine_df.crossJoin(pairs_df)
-
-    locf_window = (
-        Window.partitionBy("currency_from", "currency_to")
-        .orderBy(F.col("rate_date").asc())
-        .rowsBetween(Window.unboundedPreceding, Window.currentRow)
-    )
-    silver_df = (
-        spine_df.join(
-            valid_raw_df,
-            on=["rate_date", "currency_from", "currency_to"],
-            how="left",
+    try:
+        quarantine_df = evaluated_df.filter(
+            (F.size("dq_reasons") > 0) & (F.col("_batch_date") == F.to_date(F.lit(iso_date)))
         )
-        .withColumn("rate", F.last("raw_rate", ignorenulls=True).over(locf_window))
-        .withColumn("_is_forward_filled", F.col("raw_rate").isNull())
-        .withColumn("_silver_updated_at", F.current_timestamp())
-        .select(*SILVER_FX_RATES_COLUMNS)
-    )
 
-    write_delta_overwrite(silver_df, silver_path)
-    write_quarantine(spark, quarantine_df, quarantine_path, iso_date)
+        dedup_window = Window.partitionBy("rate_date", "currency_from", "currency_to").orderBy(
+            F.col("_ingested_at").desc(),
+            F.col("raw_rate").asc(),
+        )
+        valid_raw_df = (
+            evaluated_df.filter(F.size("dq_reasons") == 0)
+            .drop("dq_reasons")
+            .withColumn("_rn", F.row_number().over(dedup_window))
+            .filter(F.col("_rn") == 1)
+            .drop("_rn")
+            .select("rate_date", "currency_from", "currency_to", "raw_rate")
+        )
+
+        min_date_row = valid_raw_df.agg(F.min("rate_date").alias("min_date")).first()
+        start_date = min_date_row["min_date"] if min_date_row is not None else None
+        if start_date is None:
+            raise ValueError(f"No valid bronze/fx_rates records found on or before {iso_date}")
+
+        calendar_spine_df = spark.sql(
+            f"SELECT explode(sequence(DATE '{start_date.isoformat()}', "
+            f"DATE '{effective_end_date.isoformat()}', INTERVAL 1 DAY)) AS rate_date"
+        )
+        canonical_pairs_df = spark.createDataFrame(
+            list(CANONICAL_CURRENCY_PAIRS), schema=CURRENCY_PAIR_SCHEMA
+        )
+        pairs_df = canonical_pairs_df.unionByName(
+            valid_raw_df.select("currency_from", "currency_to").distinct()
+        ).distinct()
+
+        spine_df = calendar_spine_df.crossJoin(pairs_df)
+
+        locf_window = (
+            Window.partitionBy("currency_from", "currency_to")
+            .orderBy(F.col("rate_date").asc())
+            .rowsBetween(Window.unboundedPreceding, Window.currentRow)
+        )
+        silver_df = (
+            spine_df.join(
+                valid_raw_df,
+                on=["rate_date", "currency_from", "currency_to"],
+                how="left",
+            )
+            .withColumn("rate", F.last("raw_rate", ignorenulls=True).over(locf_window))
+            .withColumn("_is_forward_filled", F.col("raw_rate").isNull())
+            .withColumn("_silver_updated_at", F.current_timestamp())
+            .select(*SILVER_FX_RATES_COLUMNS)
+        )
+
+        write_delta_overwrite(silver_df, silver_path)
+        write_quarantine(spark, quarantine_df, quarantine_path, iso_date)
+    finally:
+        evaluated_df.unpersist()
 
     persisted_df = spark.read.format("delta").load(silver_path)
     dq_results = [

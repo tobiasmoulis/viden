@@ -164,60 +164,68 @@ def transform_invoices(
     )
     evaluated_df = checked_df.withColumn(
         "dq_reasons", F.filter(reason_exprs, lambda reason: reason.isNotNull())
-    )
+    ).persist()
 
-    orphan_count = evaluated_df.filter(is_orphan).count()
-    total_evaluated = evaluated_df.count()
+    try:
+        orphan_count = evaluated_df.filter(is_orphan).count()
+        total_evaluated = evaluated_df.count()
 
-    quarantine_df = evaluated_df.filter(F.size("dq_reasons") > 0).drop(
-        "_is_orphan_project", "_raw_issued_at", "_raw_paid_at"
-    )
+        quarantine_df = evaluated_df.filter(F.size("dq_reasons") > 0).drop(
+            "_is_orphan_project", "_raw_issued_at", "_raw_paid_at"
+        )
 
-    dedup_window = Window.partitionBy("inv_id").orderBy(
-        F.col("_ingested_at").desc(),
-        F.col("amount").asc(),
-    )
-    valid_candidates_df = (
-        evaluated_df.filter(F.size("dq_reasons") == 0)
-        .drop("dq_reasons", "_is_orphan_project", "_raw_issued_at", "_raw_paid_at")
-        .withColumn("_rn", F.row_number().over(dedup_window))
-        .filter(F.col("_rn") == 1)
-        .drop("_rn")
-    )
+        dedup_window = Window.partitionBy("inv_id").orderBy(
+            F.col("_ingested_at").desc(),
+            F.col("amount").asc(),
+        )
+        valid_candidates_df = (
+            evaluated_df.filter(F.size("dq_reasons") == 0)
+            .drop("dq_reasons", "_is_orphan_project", "_raw_issued_at", "_raw_paid_at")
+            .withColumn("_rn", F.row_number().over(dedup_window))
+            .filter(F.col("_rn") == 1)
+            .drop("_rn")
+        )
 
-    fx_to_eur_df = _load_fx_to_eur(spark, resolved_lakehouse)
-    enriched_df = valid_candidates_df.join(
-        F.broadcast(fx_to_eur_df),
-        on=(
-            (valid_candidates_df["issued_date"] == fx_to_eur_df["_fx_date"])
-            & (valid_candidates_df["currency"] == fx_to_eur_df["_fx_currency"])
-        ),
-        how="left",
-    )
+        fx_to_eur_df = _load_fx_to_eur(spark, resolved_lakehouse)
+        enriched_df = valid_candidates_df.join(
+            F.broadcast(fx_to_eur_df),
+            on=(
+                (valid_candidates_df["issued_date"] == fx_to_eur_df["_fx_date"])
+                & (valid_candidates_df["currency"] == fx_to_eur_df["_fx_currency"])
+            ),
+            how="left",
+        )
 
-    effective_rate = F.when(F.col("currency") == F.lit("EUR"), F.lit(1.0)).otherwise(
-        F.col("_fx_rate")
-    )
-    amount_eur_col = F.col("amount") * effective_rate
+        effective_rate = F.when(F.col("currency") == F.lit("EUR"), F.lit(1.0)).otherwise(
+            F.col("_fx_rate")
+        )
+        amount_eur_col = F.col("amount") * effective_rate
 
-    valid_df = (
-        enriched_df.withColumn("is_credit_note", F.col("amount") < F.lit(0.0))
-        .withColumn("amount_eur", amount_eur_col)
-        .withColumn("net_amount_eur", amount_eur_col)
-        .withColumn("_silver_updated_at", F.current_timestamp())
-        .select(*SILVER_INVOICES_COLUMNS)
-    )
+        valid_df = (
+            enriched_df.withColumn("is_credit_note", F.col("amount") < F.lit(0.0))
+            .withColumn("amount_eur", amount_eur_col)
+            .withColumn("net_amount_eur", amount_eur_col)
+            .withColumn("_silver_updated_at", F.current_timestamp())
+            .select(*SILVER_INVOICES_COLUMNS)
+        )
 
-    write_delta_partition(spark, valid_df, silver_path, iso_date)
-    write_quarantine(spark, quarantine_df, quarantine_path, iso_date)
+        write_delta_partition(spark, valid_df, silver_path, iso_date)
+        write_quarantine(spark, quarantine_df, quarantine_path, iso_date)
+    finally:
+        evaluated_df.unpersist()
 
     persisted_batch_df = (
         spark.read.format("delta")
         .load(silver_path)
         .filter(F.col("_batch_date") == F.to_date(F.lit(iso_date)))
     )
+    persisted_quarantine_df = (
+        spark.read.format("delta")
+        .load(quarantine_path)
+        .filter(F.col("_batch_date") == F.to_date(F.lit(iso_date)))
+    )
     valid_count = persisted_batch_df.count()
-    quarantined_count = quarantine_df.count()
+    quarantined_count = persisted_quarantine_df.count()
 
     dq_results = [
         check_expected_columns(
@@ -281,7 +289,7 @@ def transform_invoices(
     write_audit_results(spark, dq_results, audit_path)
     enforce_dq_gate(dq_results)
 
-    return persisted_batch_df, quarantine_df
+    return persisted_batch_df, persisted_quarantine_df
 
 
 def transform_expenses(
@@ -320,8 +328,18 @@ def transform_expenses(
 
     raw_count = normalized_df.count()
 
-    # Deterministic deduplication by `exp_id` (per docs/architecture.md Section 5).
+    # Deterministic deduplication by `exp_id` (per docs/architecture.md Section 5):
+    # Prefer valid positive-amount row over corrupted near-duplicate, then lowest amount.
+    is_valid_expense = (
+        F.col("department").isNotNull()
+        & F.col("category").isNotNull()
+        & F.col("amount").isNotNull()
+        & (F.col("amount") > 0)
+        & F.col("currency").isNotNull()
+        & F.col("expense_date").isNotNull()
+    )
     dedup_window = Window.partitionBy("exp_id").orderBy(
+        F.when(is_valid_expense, F.lit(0)).otherwise(F.lit(1)).asc(),
         F.col("amount").asc_nulls_last(),
         F.col("currency").asc_nulls_last(),
         F.col("department").asc_nulls_last(),
@@ -350,40 +368,48 @@ def transform_expenses(
     )
     evaluated_df = dedup_df.withColumn(
         "dq_reasons", F.filter(reason_exprs, lambda reason: reason.isNotNull())
-    )
+    ).persist()
 
-    quarantine_df = evaluated_df.filter(F.size("dq_reasons") > 0)
-    valid_candidates_df = evaluated_df.filter(F.size("dq_reasons") == 0).drop("dq_reasons")
+    try:
+        quarantine_df = evaluated_df.filter(F.size("dq_reasons") > 0)
+        valid_candidates_df = evaluated_df.filter(F.size("dq_reasons") == 0).drop("dq_reasons")
 
-    fx_to_eur_df = _load_fx_to_eur(spark, resolved_lakehouse)
-    enriched_df = valid_candidates_df.join(
-        F.broadcast(fx_to_eur_df),
-        on=(
-            (valid_candidates_df["expense_date"] == fx_to_eur_df["_fx_date"])
-            & (valid_candidates_df["currency"] == fx_to_eur_df["_fx_currency"])
-        ),
-        how="left",
-    )
+        fx_to_eur_df = _load_fx_to_eur(spark, resolved_lakehouse)
+        enriched_df = valid_candidates_df.join(
+            F.broadcast(fx_to_eur_df),
+            on=(
+                (valid_candidates_df["expense_date"] == fx_to_eur_df["_fx_date"])
+                & (valid_candidates_df["currency"] == fx_to_eur_df["_fx_currency"])
+            ),
+            how="left",
+        )
 
-    effective_rate = F.when(F.col("currency") == F.lit("EUR"), F.lit(1.0)).otherwise(
-        F.col("_fx_rate")
-    )
-    valid_df = (
-        enriched_df.withColumn("amount_eur", F.col("amount") * effective_rate)
-        .withColumn("_silver_updated_at", F.current_timestamp())
-        .select(*SILVER_EXPENSES_COLUMNS)
-    )
+        effective_rate = F.when(F.col("currency") == F.lit("EUR"), F.lit(1.0)).otherwise(
+            F.col("_fx_rate")
+        )
+        valid_df = (
+            enriched_df.withColumn("amount_eur", F.col("amount") * effective_rate)
+            .withColumn("_silver_updated_at", F.current_timestamp())
+            .select(*SILVER_EXPENSES_COLUMNS)
+        )
 
-    write_delta_partition(spark, valid_df, silver_path, iso_date)
-    write_quarantine(spark, quarantine_df, quarantine_path, iso_date)
+        write_delta_partition(spark, valid_df, silver_path, iso_date)
+        write_quarantine(spark, quarantine_df, quarantine_path, iso_date)
+    finally:
+        evaluated_df.unpersist()
 
     persisted_batch_df = (
         spark.read.format("delta")
         .load(silver_path)
         .filter(F.col("_batch_date") == F.to_date(F.lit(iso_date)))
     )
+    persisted_quarantine_df = (
+        spark.read.format("delta")
+        .load(quarantine_path)
+        .filter(F.col("_batch_date") == F.to_date(F.lit(iso_date)))
+    )
     valid_count = persisted_batch_df.count()
-    quarantined_count = quarantine_df.count()
+    quarantined_count = persisted_quarantine_df.count()
 
     dq_results = [
         check_expected_columns(
@@ -447,7 +473,7 @@ def transform_expenses(
     write_audit_results(spark, dq_results, audit_path)
     enforce_dq_gate(dq_results)
 
-    return persisted_batch_df, quarantine_df
+    return persisted_batch_df, persisted_quarantine_df
 
 
 def run(
