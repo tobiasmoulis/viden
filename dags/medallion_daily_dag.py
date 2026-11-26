@@ -53,14 +53,26 @@ with DAG(
     max_active_runs=1,
     tags=["lakehouse", "medallion", "spark"],
 ) as dag:
-    # TODO (Student Deliverable): Extend landing file checks to validate daily batch
-    # partitions for `employees`, `timesheets`, `invoices`, `expenses`, `crm_events`,
-    # and weekday-only `fx_rates` (skipping Saturdays/Sundays).
     sense_landing_files = BashOperator(
         task_id="sense_landing_files",
         bash_command=(
-            'test -f "${LANDING_ROOT:-/opt/workspace/data/landing}/clients/clients.csv" '
-            '|| { echo "Missing clients.csv in LANDING_ROOT"; exit 1; }'
+            'ROOT="${LANDING_ROOT:-/opt/workspace/data/landing}" && '
+            'DS="{{ ds }}" && '
+            "for f in "
+            '"clients/clients.csv" '
+            '"projects/projects.csv" '
+            '"survey_questions/survey_questions.json" '
+            '"employees/date=${DS}/part-000.csv" '
+            '"timesheets/date=${DS}/part-000.parquet" '
+            '"invoices/date=${DS}/part-000.jsonl" '
+            '"expenses/date=${DS}/part-000.csv" '
+            '"crm_events/date=${DS}/part-000.jsonl"; do '
+            'test -f "${ROOT}/${f}" || { echo "Missing ${f} in ${ROOT}"; exit 1; }; '
+            "done && "
+            'if [ "{{ logical_date.isoweekday() }}" -le 5 ]; then '
+            'test -f "${ROOT}/fx_rates/date=${DS}/part-000.json" '
+            '|| { echo "Missing weekday fx_rates for ${DS}"; exit 1; }; '
+            "fi"
         ),
     )
 
@@ -72,11 +84,34 @@ with DAG(
                 '/opt/workspace/spark_jobs/bronze/ingest_clients.py --batch-date "{{ ds }}"'
             ),
         )
-        # TODO: Replace these placeholders with BashOperator / SparkSubmitOperator tasks.
-        ingest_reference_todo = EmptyOperator(task_id="ingest_reference_todo")
-        ingest_hr_todo = EmptyOperator(task_id="ingest_hr_todo")
-        ingest_finance_todo = EmptyOperator(task_id="ingest_finance_todo")
-        ingest_crm_surveys_todo = EmptyOperator(task_id="ingest_crm_surveys_todo")
+        ingest_reference = BashOperator(
+            task_id="ingest_reference",
+            bash_command=(
+                'spark-submit --master "${SPARK_MASTER_URL:-spark://spark-master:7077}" '
+                '/opt/workspace/spark_jobs/bronze/ingest_reference.py --batch-date "{{ ds }}"'
+            ),
+        )
+        ingest_hr = BashOperator(
+            task_id="ingest_hr",
+            bash_command=(
+                'spark-submit --master "${SPARK_MASTER_URL:-spark://spark-master:7077}" '
+                '/opt/workspace/spark_jobs/bronze/ingest_hr.py --batch-date "{{ ds }}"'
+            ),
+        )
+        ingest_finance = BashOperator(
+            task_id="ingest_finance",
+            bash_command=(
+                'spark-submit --master "${SPARK_MASTER_URL:-spark://spark-master:7077}" '
+                '/opt/workspace/spark_jobs/bronze/ingest_finance.py --batch-date "{{ ds }}"'
+            ),
+        )
+        ingest_crm_surveys = BashOperator(
+            task_id="ingest_crm_surveys",
+            bash_command=(
+                'spark-submit --master "${SPARK_MASTER_URL:-spark://spark-master:7077}" '
+                '/opt/workspace/spark_jobs/bronze/ingest_crm_surveys.py --batch-date "{{ ds }}"'
+            ),
+        )
 
     # TODO: Wire Bronze DQ gate validating mandatory daily partitions & row counts.
     dq_bronze_gate = EmptyOperator(task_id="dq_bronze_gate")
