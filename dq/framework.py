@@ -183,16 +183,18 @@ def write_audit_results(
     audit_df = spark.createDataFrame(rows, schema=DQ_AUDIT_SCHEMA)
 
     if DeltaTable.isDeltaTable(spark, audit_table_path):
-        # Replace existing audit records for the same (batch_date, layer, table_name)
-        # so re-running a batch remains strictly idempotent.
-        unique_scopes = {(r.batch_date, r.layer, r.table_name) for r in results}
+        # Replace existing audit records for the same (batch_date, layer, table_name, check_name)
+        # so re-running a batch or central DQ gate remains idempotent without erasing
+        # checks emitted by individual Silver/Gold jobs.
+        unique_scopes = {(r.batch_date, r.layer, r.table_name, r.check_name) for r in results}
         predicates = [
             (
                 f"(batch_date = DATE '{bd.isoformat()}' "
                 f"AND layer = '{_escape_sql_literal(lyr)}' "
-                f"AND table_name = '{_escape_sql_literal(tbl)}')"
+                f"AND table_name = '{_escape_sql_literal(tbl)}' "
+                f"AND check_name = '{_escape_sql_literal(chk)}')"
             )
-            for bd, lyr, tbl in sorted(unique_scopes)
+            for bd, lyr, tbl, chk in sorted(unique_scopes)
         ]
         DeltaTable.forPath(spark, audit_table_path).delete(" OR ".join(predicates))
         audit_df.write.format("delta").mode("append").partitionBy("batch_date").save(
