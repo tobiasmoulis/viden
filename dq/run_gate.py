@@ -43,7 +43,7 @@ from spark_jobs.common.spark_session import (
 BRONZE_FULL_LOAD_TABLES = ("clients", "projects", "survey_questions")
 BRONZE_DAILY_MANDATORY_TABLES = ("employees", "timesheets", "invoices", "expenses", "crm_events")
 
-# Mandatory Silver tables currently implemented in the repository.
+# All 11 Silver tables are implemented and enforced as mandatory by `dq_silver_gate`.
 SILVER_MANDATORY_SPECS: tuple[dict, ...] = (
     {
         "table": "silver_clients",
@@ -53,6 +53,11 @@ SILVER_MANDATORY_SPECS: tuple[dict, ...] = (
     {
         "table": "silver_projects",
         "pk": ("project_id",),
+        "partitioned": False,
+    },
+    {
+        "table": "silver_survey_questions",
+        "pk": ("question_id",),
         "partitioned": False,
     },
     {
@@ -84,16 +89,6 @@ SILVER_MANDATORY_SPECS: tuple[dict, ...] = (
         "partitioned": True,
         "eur_col": "amount_eur",
     },
-)
-
-# Pending Silver tables owned by CRM/Surveys domain — validated automatically once present,
-# promoted to mandatory when `--strict` is passed or once wired into the DAG.
-SILVER_OPTIONAL_SPECS: tuple[dict, ...] = (
-    {
-        "table": "silver_survey_questions",
-        "pk": ("question_id",),
-        "partitioned": False,
-    },
     {
         "table": "silver_crm_events",
         "pk": ("event_id",),
@@ -112,6 +107,8 @@ SILVER_OPTIONAL_SPECS: tuple[dict, ...] = (
         "allow_empty": True,
     },
 )
+
+SILVER_OPTIONAL_SPECS: tuple[dict, ...] = ()
 
 GOLD_SPECS: tuple[dict, ...] = (
     {
